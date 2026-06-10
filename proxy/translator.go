@@ -370,20 +370,47 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool, model string) st
 // always added last so the instructions cannot be filtered away. Applies even when
 // the original system prompt is empty.
 //
-// The {model} placeholder in the extra instructions is replaced with the actual
-// resolved model name (thinking suffix already stripped), so operators can inject
-// the model identity into the prompt.
+// The {model} placeholder in the extra instructions is replaced with a
+// human-friendly display name derived from the resolved model ID (thinking
+// suffix already stripped). E.g. "claude-opus-4.8" → "Claude Opus 4.8".
 func appendExtraPrompt(prompt, model string) string {
 	extra := strings.TrimSpace(config.GetAppendPrompt())
 	if extra == "" {
 		return prompt
 	}
-	extra = strings.ReplaceAll(extra, "{model}", model)
+	extra = strings.ReplaceAll(extra, "{model}", formatModelDisplayName(model))
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return extra
 	}
 	return prompt + "\n\n" + extra
+}
+
+// formatModelDisplayName converts an internal Kiro model ID into a human-friendly
+// display name for the {model} placeholder. e.g.:
+//   "claude-opus-4.8"   → "Claude Opus 4.8"
+//   "claude-sonnet-4.5" → "Claude Sonnet 4.5"
+//   "claude-haiku-4.5"  → "Claude Haiku 4.5"
+// Each '-'-separated segment is title-cased; pure version segments (digits/dots)
+// are kept as-is. Unknown formats degrade gracefully to the same title-casing.
+func formatModelDisplayName(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return model
+	}
+	parts := strings.Split(model, "-")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		// Version-like segments (start with a digit) stay verbatim: "4.8", "20250514".
+		if p[0] >= '0' && p[0] <= '9' {
+			continue
+		}
+		// Title-case the first letter, keep the rest.
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.

@@ -482,7 +482,7 @@ func (h *Handler) handleResponsesStream(
 					"status": "failed",
 					"error": map[string]string{
 						"type":    "server_error",
-						"message": err.Error(),
+						"message": sanitizeClientError(err.Error()),
 					},
 				},
 			})
@@ -576,7 +576,7 @@ func (h *Handler) handleResponsesStream(
 			"status": "failed",
 			"error": map[string]string{
 				"type":    "server_error",
-				"message": lastErr.Error(),
+				"message": sanitizeClientError(lastErr.Error()),
 			},
 		},
 	})

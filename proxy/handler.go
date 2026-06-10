@@ -1266,7 +1266,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.recordFailure()
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+				"error": map[string]string{"type": "api_error", "message": sanitizeClientError(err.Error())},
 			})
 			return
 		}
@@ -1555,7 +1555,7 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 		"type": "error",
 		"error": map[string]string{
 			"type":    errType,
-			"message": message,
+			"message": sanitizeClientError(message),
 		},
 	})
 }
@@ -2079,7 +2079,7 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
 			"type":    errType,
-			"message": message,
+			"message": sanitizeClientError(message),
 		},
 	})
 }
