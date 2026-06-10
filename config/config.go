@@ -174,6 +174,14 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// DetectTruncation enables mid-stream truncation detection. Kiro upstream emits
+	// a contextUsageEvent as a completion signal when a turn finishes normally. If a
+	// stream produces text but ends WITHOUT that signal and without any tool call, the
+	// turn was cut off mid-generation. When enabled, such turns report stop_reason
+	// "max_tokens" (instead of "end_turn") so clients like Claude Code auto-continue.
+	// Defaults to true. Set to false to disable (revert to always reporting end_turn).
+	DetectTruncation *bool `json:"detectTruncation,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -819,6 +827,24 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
+	return Save()
+}
+
+// GetDetectTruncation returns whether mid-stream truncation detection is enabled. Defaults to true.
+func GetDetectTruncation() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.DetectTruncation == nil {
+		return true
+	}
+	return *cfg.DetectTruncation
+}
+
+// UpdateDetectTruncation sets the truncation detection switch and persists the change.
+func UpdateDetectTruncation(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.DetectTruncation = &enabled
 	return Save()
 }
 

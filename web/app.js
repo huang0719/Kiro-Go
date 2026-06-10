@@ -1447,12 +1447,14 @@
     const d = await res.json();
     $('preferredEndpoint').value = d.preferredEndpoint || 'auto';
     $('endpointFallback').checked = d.endpointFallback !== false;
+    if ($('detectTruncation')) $('detectTruncation').checked = d.detectTruncation !== false;
   }
   async function saveEndpointConfig() {
     const res = await api('/endpoint', {
       method: 'POST', body: JSON.stringify({
         preferredEndpoint: $('preferredEndpoint').value,
-        endpointFallback: $('endpointFallback').checked
+        endpointFallback: $('endpointFallback').checked,
+        detectTruncation: $('detectTruncation') ? $('detectTruncation').checked : undefined
       })
     });
     const d = await res.json();

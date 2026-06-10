@@ -108,6 +108,8 @@
   "settings.endpointHint": "Select preferred endpoint. In auto-select mode, the endpoint is automatically selected based on availability.",
   "settings.endpointFallback": "Fallback to other endpoints",
   "settings.endpointFallbackHint": "When disabled, only the selected endpoint is used without automatic fallback",
+  "settings.detectTruncation": "Detect response truncation and flag continuation",
+  "settings.detectTruncationHint": "Upstream sends a completion signal on normal finish. If a reply is cut off mid-stream (text output but no completion signal and no tool call), it is flagged as max_tokens instead of a normal stop so clients auto-continue. Disable if it misfires.",
   "settings.saveEndpoint": "Save Endpoint Settings",
   "settings.endpointSaved": "Endpoint settings saved",
   "settings.adminPassword": "Admin Password",

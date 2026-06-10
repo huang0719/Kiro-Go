@@ -108,6 +108,8 @@
   "settings.endpointHint": "选择首选端点，自动选择模式下会根据可用性自动选择端点",
   "settings.endpointFallback": "端点不可用时自动切换",
   "settings.endpointFallbackHint": "关闭后，仅使用选定的端点，不会自动切换到其他端点",
+  "settings.detectTruncation": "检测响应截断并标记续写",
+  "settings.detectTruncationHint": "上游正常完成会发送完成信号。若回复中途断开（有文本输出但无完成信号、且无工具调用），标记为 max_tokens 而非正常结束，客户端据此自动续写。误判时可关闭。",
   "settings.saveEndpoint": "保存端点设置",
   "settings.endpointSaved": "端点设置已保存",
   "settings.adminPassword": "管理密码",

@@ -887,6 +887,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		// gotCompletionSignal 跟踪是否收到上游的“完成信号”(contextUsageEvent)。
+		// 上游正常结束一次响应时一定会发该事件；若流吐了内容却没收到它，
+		// 说明响应被中途截断，而非自然结束。
+		var gotCompletionSignal bool
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1252,6 +1256,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				gotCompletionSignal = true
 			},
 		}
 
@@ -1302,6 +1307,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
+		}
+
+		// 截断检测：上游正常完成时一定会发 contextUsageEvent（完成信号）。
+		// 若流吐了正文、却没收到完成信号、且没有工具调用，则判定为上游中途截断。
+		// 标 stop_reason=max_tokens（而非 end_turn），客户端（如 Claude Code）
+		// 看到 max_tokens 会自动发起续写，从而接上被截断的内容。
+		contentWasTruncated := config.GetDetectTruncation() &&
+			!gotCompletionSignal &&
+			len(toolUses) == 0 &&
+			strings.TrimSpace(rawContentBuilder.String()) != ""
+		if contentWasTruncated {
+			stopReason = "max_tokens"
+			logger.Warnf("[Truncation] Claude stream ended without completion signal (len=%d); marking stop_reason=max_tokens", rawContentBuilder.Len())
 		}
 
 		ensureMessageStart()
@@ -3462,6 +3480,7 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"preferredEndpoint": config.GetPreferredEndpoint(),
 		"endpointFallback":  config.GetEndpointFallback(),
+		"detectTruncation":  config.GetDetectTruncation(),
 	})
 }
 
@@ -3470,6 +3489,7 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 	var req struct {
 		PreferredEndpoint string `json:"preferredEndpoint"`
 		EndpointFallback  *bool  `json:"endpointFallback"`
+		DetectTruncation  *bool  `json:"detectTruncation"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3492,6 +3512,10 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 
 	if req.EndpointFallback != nil {
 		config.UpdateEndpointFallback(*req.EndpointFallback)
+	}
+
+	if req.DetectTruncation != nil {
+		config.UpdateDetectTruncation(*req.DetectTruncation)
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
