@@ -1845,6 +1845,7 @@
     $('filterClaudeCode').checked = !!d.filterClaudeCode;
     $('filterEnvNoise').checked = !!d.filterEnvNoise;
     $('filterStripBoundaries').checked = !!d.filterStripBoundaries;
+    $('appendPrompt').value = d.appendPrompt || '';
     promptRules = d.rules || [];
     renderPromptRules();
   }
@@ -1854,6 +1855,7 @@
         filterClaudeCode: $('filterClaudeCode').checked,
         filterEnvNoise: $('filterEnvNoise').checked,
         filterStripBoundaries: $('filterStripBoundaries').checked,
+        appendPrompt: $('appendPrompt').value,
         rules: promptRules
       })
     });

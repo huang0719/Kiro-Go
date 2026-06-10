@@ -198,6 +198,11 @@ type Config struct {
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
+	// AppendPrompt is extra instructions appended (NOT replacing) to the system prompt
+	// on every request. Used to enforce strict rules like "do not say you are Kiro" or
+	// "write in chunks". Applied after all filter rules so it is never stripped.
+	AppendPrompt string `json:"appendPrompt,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
@@ -678,6 +683,7 @@ type PromptFilterConfig struct {
 	FilterClaudeCode      bool               `json:"filterClaudeCode"`
 	FilterEnvNoise        bool               `json:"filterEnvNoise"`
 	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
+	AppendPrompt          string             `json:"appendPrompt"`
 	Rules                 []PromptFilterRule `json:"rules"`
 }
 
@@ -694,23 +700,35 @@ func GetPromptFilterConfig() PromptFilterConfig {
 		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
 		FilterEnvNoise:        cfg.FilterEnvNoise,
 		FilterStripBoundaries: cfg.FilterStripBoundaries,
+		AppendPrompt:          cfg.AppendPrompt,
 		Rules:                 rules,
 	}
 }
 
 // UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, appendPrompt string, rules []PromptFilterRule) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.FilterClaudeCode = filterClaudeCode
 	cfg.FilterEnvNoise = filterEnvNoise
 	cfg.FilterStripBoundaries = filterStripBoundaries
+	cfg.AppendPrompt = appendPrompt
 	// Clear legacy flag to avoid double-applying after first save
 	cfg.SanitizeClaudeCodePrompt = false
 	if rules != nil {
 		cfg.PromptFilterRules = rules
 	}
 	return Save()
+}
+
+// GetAppendPrompt returns the extra instructions appended to every system prompt.
+func GetAppendPrompt() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.AppendPrompt
 }
 
 // GetPromptFilterRules returns the current prompt filter rules.

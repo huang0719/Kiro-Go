@@ -803,6 +803,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// 联网搜索注入：检测到服务端 web_search 工具时，搜索并把结果追加到 messages。
+	// 必须在 thinking 解析 / token 估算 / 转换之前完成，这样后续流程基于注入后的消息。
+	searchMeta := InjectClaudeWebSearch(&req)
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
@@ -818,14 +822,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, searchMeta)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, searchMeta)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, searchMeta *WebSearchMeta) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -890,6 +894,60 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		activeBlockIndex := -1
 		activeBlockType := ""
 
+		// 联网搜索元数据块：在第一个正文块之前发出 server_tool_use + web_search_tool_result，
+		// 占用索引 0/1，正文块从 2 开始。每次重试只发一次。
+		searchMetaEmitted := false
+		emitSearchMeta := func() {
+			if searchMetaEmitted {
+				return
+			}
+			searchMetaEmitted = true
+			if searchMeta == nil || len(searchMeta.Blocks) == 0 {
+				return
+			}
+			toolUseID := "srvtoolu_" + msgID
+			tuIdx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": tuIdx,
+				"content_block": map[string]interface{}{
+					"type":  "server_tool_use",
+					"id":    toolUseID,
+					"name":  "web_search",
+					"input": map[string]interface{}{},
+				},
+			})
+			queryJSON, _ := json.Marshal(map[string]string{"query": searchMeta.Query})
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": tuIdx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(queryJSON),
+				},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": tuIdx,
+			})
+			resIdx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": resIdx,
+				"content_block": map[string]interface{}{
+					"type":        "web_search_tool_result",
+					"tool_use_id": toolUseID,
+					"content":     searchMeta.Blocks,
+				},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": resIdx,
+			})
+		}
+
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
@@ -907,6 +965,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				return
 			}
 			ensureMessageStart()
+			emitSearchMeta()
 			closeActiveBlock()
 
 			idx := nextContentIndex
@@ -1152,6 +1211,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 				toolUses = append(toolUses, tu)
 				ensureMessageStart()
+				emitSearchMeta()
 				closeActiveBlock()
 
 				idx := nextContentIndex
@@ -1215,6 +1275,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if eventThinkingOpen {
 			sendText("", 3)
 		}
+		// 兜底：模型无任何正文输出时，仍要发出搜索元数据块。
+		emitSearchMeta()
 		closeActiveBlock()
 
 		if realInputTokens > 0 {
@@ -1243,12 +1305,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		ensureMessageStart()
+		messageDeltaUsage := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil)
+		if searchMeta != nil && searchMeta.Requests > 0 {
+			messageDeltaUsage["server_tool_use"] = map[string]interface{}{
+				"web_search_requests": searchMeta.Requests,
+			}
+		}
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": messageDeltaUsage,
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1340,7 +1408,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, searchMeta *WebSearchMeta) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1445,6 +1513,27 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
 			}
 		}
+		// 联网搜索：在正文前插入 server_tool_use + web_search_tool_result 块，并报告搜索次数。
+		if searchMeta != nil && len(searchMeta.Blocks) > 0 {
+			toolUseID := "srvtoolu_" + resp.ID
+			metaBlocks := []ClaudeContentBlock{
+				{
+					Type:  "server_tool_use",
+					ID:    toolUseID,
+					Name:  "web_search",
+					Input: map[string]interface{}{"query": searchMeta.Query},
+				},
+				{
+					Type:      "web_search_tool_result",
+					ToolUseID: toolUseID,
+					Content:   searchMeta.Blocks,
+				},
+			}
+			resp.Content = append(metaBlocks, resp.Content...)
+		}
+		if searchMeta != nil && searchMeta.Requests > 0 {
+			resp.Usage.ServerToolUse = &ClaudeServerToolUse{WebSearchRequests: searchMeta.Requests}
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -1493,6 +1582,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
+
+	// 联网搜索注入（OpenAI 格式无元数据块，仅把搜索结果追加到 messages）。
+	InjectOpenAIWebSearch(&req)
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
@@ -2910,6 +3002,7 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 		FilterClaudeCode      *bool                      `json:"filterClaudeCode,omitempty"`
 		FilterEnvNoise        *bool                      `json:"filterEnvNoise,omitempty"`
 		FilterStripBoundaries *bool                      `json:"filterStripBoundaries,omitempty"`
+		AppendPrompt          *string                    `json:"appendPrompt,omitempty"`
 		Rules                 *[]config.PromptFilterRule `json:"rules,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -2923,6 +3016,7 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	fcc := current.FilterClaudeCode
 	fen := current.FilterEnvNoise
 	fsb := current.FilterStripBoundaries
+	appendPrompt := current.AppendPrompt
 	rules := current.Rules
 	if req.FilterClaudeCode != nil {
 		fcc = *req.FilterClaudeCode
@@ -2933,10 +3027,13 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	if req.FilterStripBoundaries != nil {
 		fsb = *req.FilterStripBoundaries
 	}
+	if req.AppendPrompt != nil {
+		appendPrompt = *req.AppendPrompt
+	}
 	if req.Rules != nil {
 		rules = *req.Rules
 	}
-	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, appendPrompt, rules); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

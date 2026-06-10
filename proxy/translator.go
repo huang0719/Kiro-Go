@@ -163,6 +163,7 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
+	Type        string      `json:"type,omitempty"`
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
@@ -190,6 +191,13 @@ type ClaudeUsage struct {
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	ServerToolUse            *ClaudeServerToolUse      `json:"server_tool_use,omitempty"`
+}
+
+// ClaudeServerToolUse 报告服务端工具调用次数（联网搜索次数），
+// 客户端据此显示「搜索了 N 次」。
+type ClaudeServerToolUse struct {
+	WebSearchRequests int `json:"web_search_requests"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -347,6 +355,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
+	systemPrompt = appendExtraPrompt(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
@@ -354,6 +363,22 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 		return ThinkingModePrompt
 	}
 	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+// appendExtraPrompt appends the configured extra instructions to the end of the
+// system prompt. Unlike filter rules it never replaces or strips content — it is
+// always added last so the instructions cannot be filtered away. Applies even when
+// the original system prompt is empty.
+func appendExtraPrompt(prompt string) string {
+	extra := strings.TrimSpace(config.GetAppendPrompt())
+	if extra == "" {
+		return prompt
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return extra
+	}
+	return prompt + "\n\n" + extra
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -1099,6 +1124,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			nonSystemMessages = append(nonSystemMessages, msg)
 		}
 	}
+
+	// 追加自定义提示词（始终加在末尾，不会被过滤掉）
+	systemPrompt = appendExtraPrompt(systemPrompt)
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
