@@ -209,7 +209,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, modelID)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -352,10 +352,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, thinking bool, model string) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
-	systemPrompt = appendExtraPrompt(systemPrompt)
+	systemPrompt = appendExtraPrompt(systemPrompt, model)
 	if !thinking {
 		return systemPrompt
 	}
@@ -369,11 +369,16 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 // system prompt. Unlike filter rules it never replaces or strips content — it is
 // always added last so the instructions cannot be filtered away. Applies even when
 // the original system prompt is empty.
-func appendExtraPrompt(prompt string) string {
+//
+// The {model} placeholder in the extra instructions is replaced with the actual
+// resolved model name (thinking suffix already stripped), so operators can inject
+// the model identity into the prompt.
+func appendExtraPrompt(prompt, model string) string {
 	extra := strings.TrimSpace(config.GetAppendPrompt())
 	if extra == "" {
 		return prompt
 	}
+	extra = strings.ReplaceAll(extra, "{model}", model)
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return extra
@@ -1126,7 +1131,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 追加自定义提示词（始终加在末尾，不会被过滤掉）
-	systemPrompt = appendExtraPrompt(systemPrompt)
+	systemPrompt = appendExtraPrompt(systemPrompt, modelID)
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {

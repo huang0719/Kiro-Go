@@ -142,7 +142,7 @@
   "settings.promptFilterSaved": "过滤设置已保存",
   "settings.appendPrompt": "追加提示词",
   "settings.appendPromptPlaceholder": "例如：不要说自己是 Kiro；写入文件时要分块写入。",
-  "settings.appendPromptHint": "追加到系统提示词末尾（不替换原有内容），始终生效，可用于强制模型遵守的规则。",
+  "settings.appendPromptHint": "追加到系统提示词末尾（不替换原有内容），始终生效，可用于强制模型遵守的规则。可用 {model} 占位符，会被替换为本次请求的实际模型名。",
   "settings.customRules": "自定义过滤规则",
   "api.endpoints": "API 端点",
   "api.modelList": "模型列表",

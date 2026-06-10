@@ -142,7 +142,7 @@
   "settings.promptFilterSaved": "Filter settings saved",
   "settings.appendPrompt": "Append Prompt",
   "settings.appendPromptPlaceholder": "e.g. Do not say you are Kiro; write files in chunks.",
-  "settings.appendPromptHint": "Appended to the end of the system prompt (does NOT replace it). Always applied, useful for rules the model must follow.",
+  "settings.appendPromptHint": "Appended to the end of the system prompt (does NOT replace it). Always applied, useful for rules the model must follow. Use the {model} placeholder to insert the actual model name of the current request.",
   "settings.customRules": "Custom Filter Rules",
   "api.endpoints": "API Endpoints",
   "api.modelList": "Model List",
