@@ -891,6 +891,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// 上游正常结束一次响应时一定会发该事件；若流吐了内容却没收到它，
 		// 说明响应被中途截断，而非自然结束。
 		var gotCompletionSignal bool
+		// streamTruncated 由 OnTruncated 回调置位：上游在消息中途断流
+		// (ErrUnexpectedEOF)，是明确的截断信号。
+		var streamTruncated bool
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1258,15 +1261,46 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 				gotCompletionSignal = true
 			},
+			OnTruncated: func() {
+				streamTruncated = true
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
+			logger.Warnf("[Truncation][diag] Claude stream ERROR exit: err=%v messageStarted=%v gotCompletionSignal=%v contentLen=%d toolUses=%d",
+				err, messageStarted, gotCompletionSignal, rawContentBuilder.Len(), len(toolUses))
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
 				continue
+			}
+			// 流已经开始（已向客户端发送内容），上游却中途报错断开。
+			// 若已吐正文、无完成信号、无工具调用，则判定为中途截断：
+			// 不发 error（会让客户端整轮失败），而是正常收尾并标 max_tokens，
+			// 让客户端（如 Claude Code）看到 max_tokens 后自动续写。
+			if config.GetDetectTruncation() && !gotCompletionSignal &&
+				len(toolUses) == 0 && strings.TrimSpace(rawContentBuilder.String()) != "" {
+				logger.Warnf("[Truncation] Claude stream errored mid-content (len=%d); recovering as max_tokens instead of error", rawContentBuilder.Len())
+				processClaudeText("", false, true)
+				if eventThinkingOpen {
+					sendText("", 3)
+				}
+				closeActiveBlock()
+				ensureMessageStart()
+				h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+					"type": "message_delta",
+					"delta": map[string]interface{}{
+						"stop_reason": "max_tokens",
+					},
+					"usage": buildClaudeUsageMap(estimatedInputTokens, estimateClaudeOutputTokens(rawContentBuilder.String(), rawThinkingBuilder.String(), toolUses), cacheUsage, cacheProfile != nil),
+				})
+				h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+					"type": "message_stop",
+				})
+				h.pool.RecordSuccess(account.ID)
+				return
 			}
 			h.recordFailure()
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
@@ -1313,13 +1347,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// 若流吐了正文、却没收到完成信号、且没有工具调用，则判定为上游中途截断。
 		// 标 stop_reason=max_tokens（而非 end_turn），客户端（如 Claude Code）
 		// 看到 max_tokens 会自动发起续写，从而接上被截断的内容。
+		// 截断判定：满足任一即认为被中途截断（且开关开启、有正文、无工具调用）：
+		//   1. streamTruncated：parseEventStream 读到半个消息就断流（ErrUnexpectedEOF）——硬证据
+		//   2. !gotCompletionSignal：流干净结束但没收到 contextUsageEvent 完成信号——软信号
 		contentWasTruncated := config.GetDetectTruncation() &&
-			!gotCompletionSignal &&
+			(streamTruncated || !gotCompletionSignal) &&
 			len(toolUses) == 0 &&
 			strings.TrimSpace(rawContentBuilder.String()) != ""
+		logger.Warnf("[Truncation][diag] Claude stream NORMAL exit: streamTruncated=%v gotCompletionSignal=%v contentLen=%d toolUses=%d -> truncated=%v",
+			streamTruncated, gotCompletionSignal, rawContentBuilder.Len(), len(toolUses), contentWasTruncated)
 		if contentWasTruncated {
 			stopReason = "max_tokens"
-			logger.Warnf("[Truncation] Claude stream ended without completion signal (len=%d); marking stop_reason=max_tokens", rawContentBuilder.Len())
+			logger.Warnf("[Truncation] Claude stream truncated (streamTruncated=%v, len=%d); marking stop_reason=max_tokens", streamTruncated, rawContentBuilder.Len())
 		}
 
 		ensureMessageStart()

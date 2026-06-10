@@ -239,6 +239,9 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnTruncated 在流被上游中途截断（消息边界内 EOF/ErrUnexpectedEOF）时触发，
+	// 上层据此把 stop_reason 标为 max_tokens，引导客户端续写。
+	OnTruncated func()
 }
 
 // ==================== API Call ====================
@@ -417,12 +420,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	// truncated 标记流是否在消息中途被掐断（上游截断），用于通知上层改写 stop_reason。
+	var truncated bool
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
+			break
+		}
+		if err == io.ErrUnexpectedEOF {
+			// 读到半个 prelude 就断流：上游中途截断，不当错误处理，
+			// 通知上层后正常结束，让 stop_reason 判定逻辑得以执行。
+			truncated = true
 			break
 		}
 		if err != nil {
@@ -440,6 +451,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		remaining := totalLength - 12
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// 消息体中途断流：上游截断，不当错误处理，正常结束。
+			truncated = true
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -498,6 +514,10 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
+	}
+
+	if truncated && callback.OnTruncated != nil {
+		callback.OnTruncated()
 	}
 
 	if callback.OnComplete != nil {
