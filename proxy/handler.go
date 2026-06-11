@@ -1130,6 +1130,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						}
 						break
 					}
+					if transcriptStart := executionTranscriptStartPattern.FindStringIndex(textBuffer); transcriptStart != nil {
+						if transcriptStart[0] > 0 {
+							sendText(textBuffer[:transcriptStart[0]], 0)
+						}
+						textBuffer = textBuffer[transcriptStart[0]:]
+						if forceFlush {
+							textBuffer = ""
+						}
+						break
+					}
 
 					thinkingStart := strings.Index(textBuffer, "<thinking>")
 					if thinkingStart != -1 {
@@ -1860,6 +1870,28 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 			for {
 				if !inThinkingBlock {
+					toolTextStart := strings.Index(strings.ToLower(textBuffer), "[called")
+					if toolTextStart != -1 {
+						if toolTextStart > 0 {
+							sendChunk(textBuffer[:toolTextStart], 0)
+						}
+						textBuffer = textBuffer[toolTextStart:]
+						if forceFlush {
+							textBuffer = ""
+						}
+						break
+					}
+					if transcriptStart := executionTranscriptStartPattern.FindStringIndex(textBuffer); transcriptStart != nil {
+						if transcriptStart[0] > 0 {
+							sendChunk(textBuffer[:transcriptStart[0]], 0)
+						}
+						textBuffer = textBuffer[transcriptStart[0]:]
+						if forceFlush {
+							textBuffer = ""
+						}
+						break
+					}
+
 					thinkingStart := strings.Index(textBuffer, "<thinking>")
 					if thinkingStart != -1 {
 						if thinkingStart > 0 {
