@@ -47,14 +47,10 @@ const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
-// Kiro's upstream rejects oversized requests with HTTP 400
-// "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
-// payload exceeds this size we drop the oldest history turns (keeping the
-// system priming, the most recent turns, the active tool turn, and the current
-// message) and insert a placeholder note so the model knows context was elided.
-// The limit is kept conservatively below the observed upstream threshold to
-// leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
+// Kiro upstream rejects payloads above roughly 615KB with context-length or
+// malformed-request errors. Keep the local trim line below that hard limit so
+// long conversations are shortened before the upstream can drop the request.
+const maxPayloadBytes = 600000
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
@@ -388,9 +384,11 @@ func appendExtraPrompt(prompt, model string) string {
 
 // formatModelDisplayName converts an internal Kiro model ID into a human-friendly
 // display name for the {model} placeholder. e.g.:
-//   "claude-opus-4.8"   → "Claude Opus 4.8"
-//   "claude-sonnet-4.5" → "Claude Sonnet 4.5"
-//   "claude-haiku-4.5"  → "Claude Haiku 4.5"
+//
+//	"claude-opus-4.8"   → "Claude Opus 4.8"
+//	"claude-sonnet-4.5" → "Claude Sonnet 4.5"
+//	"claude-haiku-4.5"  → "Claude Haiku 4.5"
+//
 // Each '-'-separated segment is title-cased; pure version segments (digits/dots)
 // are kept as-is. Unknown formats degrade gracefully to the same title-casing.
 func formatModelDisplayName(model string) string {
@@ -987,6 +985,9 @@ func shortenToolName(name string) string {
 // ==================== Kiro -> Claude 转换 ====================
 
 func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+	content, parsedToolUses := parseEmittedToolCallText(content)
+	toolUses = append(toolUses, parsedToolUses...)
+
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -1472,6 +1473,7 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 // assistant content on the way back upstream so the pattern is not reinforced
 // and the model can recover within an ongoing session.
 var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
+var emittedToolCallTextPattern = regexp.MustCompile(`(?is)\[Called\s+(?:tool\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+with\s+(?:args|input):?\s*`)
 
 // stripPollutedToolCallText removes legacy tool-call narration from text and
 // tidies up the leftover whitespace.
@@ -1483,6 +1485,104 @@ func stripPollutedToolCallText(content string) string {
 	// Collapse blank lines left behind by removed markers.
 	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
 	return strings.TrimSpace(cleaned)
+}
+
+// parseEmittedToolCallText 解析模型误输出成文字的工具调用。
+func parseEmittedToolCallText(content string) (string, []KiroToolUse) {
+	if !strings.Contains(strings.ToLower(content), "[called") {
+		return content, nil
+	}
+
+	var toolUses []KiroToolUse
+	var cleaned strings.Builder
+	cursor := 0
+	matches := emittedToolCallTextPattern.FindAllStringSubmatchIndex(content, -1)
+	for _, match := range matches {
+		if len(match) < 4 || match[0] < cursor {
+			continue
+		}
+		jsonStart := strings.Index(content[match[1]:], "{")
+		if jsonStart == -1 {
+			continue
+		}
+		jsonStart += match[1]
+		jsonEnd := findMatchingJSONBrace(content, jsonStart)
+		if jsonEnd == -1 {
+			continue
+		}
+
+		var input map[string]interface{}
+		if err := json.Unmarshal([]byte(content[jsonStart:jsonEnd+1]), &input); err != nil {
+			continue
+		}
+		if input == nil {
+			input = make(map[string]interface{})
+		}
+
+		cleaned.WriteString(content[cursor:match[0]])
+		toolUses = append(toolUses, KiroToolUse{
+			ToolUseID: "toolu_" + uuid.New().String(),
+			Name:      content[match[2]:match[3]],
+			Input:     input,
+		})
+
+		cursor = jsonEnd + 1
+		for cursor < len(content) && content[cursor] != ']' {
+			cursor++
+		}
+		if cursor < len(content) && content[cursor] == ']' {
+			cursor++
+		}
+	}
+
+	if len(toolUses) == 0 {
+		return content, nil
+	}
+	cleaned.WriteString(content[cursor:])
+	return strings.TrimSpace(collapseBlankLines(cleaned.String())), toolUses
+}
+
+// findMatchingJSONBrace 查找文本中 JSON 对象的右花括号。
+func findMatchingJSONBrace(text string, start int) int {
+	if start < 0 || start >= len(text) || text[start] != '{' {
+		return -1
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			continue
+		}
+		if ch == '{' {
+			depth++
+			continue
+		}
+		if ch == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // narrateToolResults renders structured tool results as plain text for a user
@@ -2082,6 +2182,9 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 // ==================== Kiro -> OpenAI 转换 ====================
 
 func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *OpenAIResponse {
+	content, parsedToolUses := parseEmittedToolCallText(content)
+	toolUses = append(toolUses, parsedToolUses...)
+
 	msg := OpenAIMessage{
 		Role: "assistant",
 	}
@@ -2152,6 +2255,9 @@ func extractThinkingFromContent(content string) (string, string) {
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
 func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
+	content, parsedToolUses := parseEmittedToolCallText(content)
+	toolUses = append(toolUses, parsedToolUses...)
+
 	finishReason := "stop"
 
 	message := map[string]interface{}{

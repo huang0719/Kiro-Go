@@ -216,6 +216,9 @@ func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
 	inputTokens, outputTokens int, req *ResponsesRequest,
 ) *ResponsesObject {
+	content, parsedToolUses := parseEmittedToolCallText(content)
+	toolUses = append(toolUses, parsedToolUses...)
+
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
 	if strings.TrimSpace(content) != "" {
@@ -445,6 +448,12 @@ func (h *Handler) handleResponsesStream(
 					"output_index": outputIndex,
 					"delta":        string(args),
 				})
+				send("response.function_call_arguments.done", map[string]interface{}{
+					"type":         "response.function_call_arguments.done",
+					"item_id":      fcID,
+					"output_index": outputIndex,
+					"arguments":    string(args),
+				})
 				send("response.output_item.done", map[string]interface{}{
 					"type":         "response.output_item.done",
 					"output_index": outputIndex,
@@ -491,6 +500,9 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
+		var parsedToolUses []KiroToolUse
+		finalContent, parsedToolUses = parseEmittedToolCallText(finalContent)
+		toolUses = append(toolUses, parsedToolUses...)
 		reasoning := reasoningText.String()
 		if !thinking {
 			reasoning = ""
@@ -521,6 +533,49 @@ func (h *Handler) handleResponsesStream(
 					}},
 				},
 			})
+			outputIndex++
+		}
+
+		for _, tu := range parsedToolUses {
+			args, _ := json.Marshal(tu.Input)
+			fcID := generateOutputItemID("fc")
+			send("response.output_item.added", map[string]interface{}{
+				"type":         "response.output_item.added",
+				"output_index": outputIndex,
+				"item": map[string]interface{}{
+					"id":        fcID,
+					"type":      "function_call",
+					"status":    "in_progress",
+					"call_id":   tu.ToolUseID,
+					"name":      tu.Name,
+					"arguments": "",
+				},
+			})
+			send("response.function_call_arguments.delta", map[string]interface{}{
+				"type":         "response.function_call_arguments.delta",
+				"item_id":      fcID,
+				"output_index": outputIndex,
+				"delta":        string(args),
+			})
+			send("response.function_call_arguments.done", map[string]interface{}{
+				"type":         "response.function_call_arguments.done",
+				"item_id":      fcID,
+				"output_index": outputIndex,
+				"arguments":    string(args),
+			})
+			send("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": outputIndex,
+				"item": map[string]interface{}{
+					"id":        fcID,
+					"type":      "function_call",
+					"status":    "completed",
+					"call_id":   tu.ToolUseID,
+					"name":      tu.Name,
+					"arguments": string(args),
+				},
+			})
+			outputIndex++
 		}
 
 		if realInputTokens > 0 {

@@ -1120,6 +1120,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 			for {
 				if !inThinkingBlock {
+					toolTextStart := strings.Index(strings.ToLower(textBuffer), "[called")
+					if toolTextStart != -1 {
+						if toolTextStart > 0 {
+							sendText(textBuffer[:toolTextStart], 0)
+						}
+						textBuffer = textBuffer[toolTextStart:]
+						if forceFlush {
+							textBuffer = ""
+						}
+						break
+					}
+
 					thinkingStart := strings.Index(textBuffer, "<thinking>")
 					if thinkingStart != -1 {
 						if thinkingStart > 0 {
@@ -1324,6 +1336,37 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			inputTokens = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		var parsedToolUses []KiroToolUse
+		outputContent, parsedToolUses = parseEmittedToolCallText(outputContent)
+		for _, tu := range parsedToolUses {
+			toolUses = append(toolUses, tu)
+			idx := nextContentIndex
+			nextContentIndex++
+
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tu.ToolUseID,
+					"name":  tu.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+			inputJSON, _ := json.Marshal(tu.Input)
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			})
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
@@ -1353,7 +1396,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		contentWasTruncated := config.GetDetectTruncation() &&
 			(streamTruncated || !gotCompletionSignal) &&
 			len(toolUses) == 0 &&
-			strings.TrimSpace(rawContentBuilder.String()) != ""
+			strings.TrimSpace(outputContent) != ""
 		logger.Warnf("[Truncation][diag] Claude stream NORMAL exit: streamTruncated=%v gotCompletionSignal=%v contentLen=%d toolUses=%d -> truncated=%v",
 			streamTruncated, gotCompletionSignal, rawContentBuilder.Len(), len(toolUses), contentWasTruncated)
 		if contentWasTruncated {
@@ -1994,6 +2037,41 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			inputTokens = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		var parsedToolUses []KiroToolUse
+		outputContent, parsedToolUses = parseEmittedToolCallText(outputContent)
+		for _, tu := range parsedToolUses {
+			args, _ := json.Marshal(tu.Input)
+			tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+			tc.Function.Name = tu.Name
+			tc.Function.Arguments = string(args)
+			toolCalls = append(toolCalls, tc)
+
+			chunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index": toolCallIndex,
+							"id":    tu.ToolUseID,
+							"type":  "function",
+							"function": map[string]string{
+								"name":      tu.Name,
+								"arguments": string(args),
+							},
+						}},
+					},
+					"finish_reason": nil,
+				}},
+			}
+			toolCallIndex++
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
 			reasoningOutput = extractedReasoning
