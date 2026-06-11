@@ -397,7 +397,6 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 // callKiroEndpointWithFirstTokenRetry 调用单个上游端点，并在首 token 超时时重新请求。
 func callKiroEndpointWithFirstTokenRetry(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, ep kiroEndpoint) error {
-	var lastErr error
 	for attempt := 1; attempt <= firstTokenMaxRetries; attempt++ {
 		err := callKiroEndpointOnce(account, payload, callback, ep)
 		if err == nil {
@@ -406,7 +405,6 @@ func callKiroEndpointWithFirstTokenRetry(account *config.Account, payload *KiroP
 		if !errors.Is(err, errFirstTokenTimeout) {
 			return err
 		}
-		lastErr = err
 		logger.Warnf("[KiroAPI] Endpoint %s first token timeout attempt %d/%d", ep.Name, attempt, firstTokenMaxRetries)
 	}
 	return fmt.Errorf("%w on %s after %d attempts", errFirstTokenTimeout, ep.Name, firstTokenMaxRetries)
