@@ -39,7 +39,7 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
+<max_thinking_length>8000</max_thinking_length>`
 
 const minimalFallbackUserContent = "."
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -1510,7 +1510,7 @@ func joinToolResultData(existing string, toolResults []KiroToolResult) string {
 // and the model can recover within an ongoing session.
 var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
 var emittedToolCallTextPattern = regexp.MustCompile(`(?is)\[Called\s+(?:tool\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+with\s+(?:args|input):?\s*`)
-var executionTranscriptStartPattern = regexp.MustCompile(`(?im)(^|\n)\s*(?:user\s+)?Tool results:\s*$|(^|\n)\s*(?:●\s*)?(?:Thought for \d+s|Update\([^)]+\)|Read\])`)
+var executionTranscriptStartPattern = regexp.MustCompile(`(?im)(^|\n)\s*(?:user\s+)?Tool results:\s*$|(^|\n)\s*(?:[●✻]\s*)?(?:Thought for \d+s|Cogitated for [\dhms\s]+|Update\([^)]+\)|Read\]|.*ctrl\+o to expand)|(^|\n)\s*user\s+\d+\s*$`)
 
 // stripPollutedAssistantText removes assistant-side execution transcript text.
 func stripPollutedAssistantText(content string) string {

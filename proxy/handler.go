@@ -842,6 +842,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
+	if thinking {
+		logger.Infof("[Thinking] Claude stream enabled model=%s format=%s omitted=%v", model, thinkingFormat, thinkingOpts.OmitDisplay)
+	}
 
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
@@ -1007,11 +1010,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
+		var dropTranscriptText bool
+		var thinkingLogged bool
+		var textLogged bool
+		var transcriptDropLogged bool
 
 		sendText := func(text string, thinkingState int) {
 			if thinkingState == 0 {
 				if text == "" {
 					return
+				}
+				if !textLogged {
+					logger.Infof("[Thinking] Claude stream first visible text model=%s len=%d", model, len([]rune(text)))
+					textLogged = true
 				}
 				startContentBlock("text")
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
@@ -1024,6 +1035,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 			if !thinking {
 				return
+			}
+			if !thinkingLogged && text != "" {
+				logger.Infof("[Thinking] Claude stream thinking started model=%s format=%s omitted=%v", model, thinkingFormat, thinkingOpts.OmitDisplay)
+				thinkingLogged = true
 			}
 
 			switch thinkingFormat {
@@ -1058,15 +1073,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				})
 			default:
 				if thinkingOpts.OmitDisplay {
-					if thinkingState == 1 {
-						startContentBlock("thinking")
-						return
-					}
 					if thinkingState == 3 {
-						if activeBlockType != "thinking" {
-							startContentBlock("thinking")
-						}
-						closeActiveBlock()
+						eventThinkingOpen = false
 					}
 					return
 				}
@@ -1114,6 +1122,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				eventThinkingOpen = false
 				thinkingStarted = false
 			}
+			if dropTranscriptText {
+				return
+			}
 
 			textBuffer += text
 
@@ -1134,6 +1145,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						if transcriptStart[0] > 0 {
 							sendText(textBuffer[:transcriptStart[0]], 0)
 						}
+						if !transcriptDropLogged {
+							logger.Warnf("[Thinking] Claude stream transcript text detected; dropping following transcript output model=%s bufferedRunes=%d", model, len([]rune(textBuffer)))
+							transcriptDropLogged = true
+						}
+						dropTranscriptText = true
 						textBuffer = textBuffer[transcriptStart[0]:]
 						if forceFlush {
 							textBuffer = ""
@@ -1150,11 +1166,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
+					} else if forceFlush || len([]rune(textBuffer)) > 180 {
 						runes := []rune(textBuffer)
 						safeLen := len(runes)
 						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
+							safeLen = max(0, len(runes)-80)
 						}
 						if safeLen > 0 {
 							sendText(string(runes[:safeLen]), 0)
@@ -1741,6 +1757,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
+		var dropTranscriptText bool
 		responseStarted := false
 
 		sendChunk := func(content string, thinkingState int) {
@@ -1865,6 +1882,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				eventThinkingOpen = false
 				thinkingStarted = false
 			}
+			if dropTranscriptText {
+				return
+			}
 
 			textBuffer += text
 
@@ -1885,6 +1905,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						if transcriptStart[0] > 0 {
 							sendChunk(textBuffer[:transcriptStart[0]], 0)
 						}
+						dropTranscriptText = true
 						textBuffer = textBuffer[transcriptStart[0]:]
 						if forceFlush {
 							textBuffer = ""
@@ -1901,11 +1922,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
+					} else if forceFlush || len([]rune(textBuffer)) > 180 {
 						runes := []rune(textBuffer)
 						safeLen := len(runes)
 						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
+							safeLen = max(0, len(runes)-80)
 						}
 						if safeLen > 0 {
 							sendChunk(string(runes[:safeLen]), 0)
