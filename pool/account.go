@@ -381,9 +381,6 @@ func accountLabel(acc *config.Account) string {
 	if strings.TrimSpace(acc.Email) != "" {
 		return acc.Email
 	}
-	if strings.TrimSpace(acc.Name) != "" {
-		return acc.Name
-	}
 	return acc.ID
 }
 
