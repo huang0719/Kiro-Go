@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -20,6 +21,18 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// firstTokenTimeout 限制 HTTP 200 后等待上游首个事件的时间。
+const firstTokenTimeout = 15 * time.Second
+
+// firstTokenMaxRetries 限制首 token 超时后的重新请求次数。
+const firstTokenMaxRetries = 3
+
+// errFirstTokenTimeout 表示上游 HTTP 200 后迟迟没有返回首个事件。
+var errFirstTokenTimeout = errors.New("kiro first token timeout")
+
+// errKiroPayloadTooLarge 表示最终请求体仍超过 Kiro 上游硬限制。
+var errKiroPayloadTooLarge = errors.New("kiro payload too large")
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
 type kiroEndpoint struct {
@@ -242,6 +255,29 @@ type KiroStreamCallback struct {
 	OnTruncated func()
 }
 
+type kiroEventFrame struct {
+	eventType    string
+	payloadBytes []byte
+}
+
+type kiroEventFrameResult struct {
+	frame     kiroEventFrame
+	done      bool
+	truncated bool
+	err       error
+}
+
+type kiroEventStreamState struct {
+	callback             *KiroStreamCallback
+	inputTokens          int
+	outputTokens         int
+	totalCredits         float64
+	currentToolUse       *toolUseState
+	lastAssistantContent string
+	lastReasoningContent string
+	truncated            bool
+}
+
 // ==================== API Call ====================
 
 func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Account) {
@@ -270,8 +306,7 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		primary = 0
 	}
 
 	if !fallback {
@@ -340,62 +375,18 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 	var lastErr error
 	for _, ep := range endpoints {
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
-
-		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
+		err := callKiroEndpointWithFirstTokenRetry(account, payload, callback, ep)
+		if err == nil {
+			return nil
 		}
-
-		host := ""
-		if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
-			host = parsedURL.Host
+		lastErr = err
+		if errors.Is(err, errKiroPayloadTooLarge) {
+			return err
 		}
-		headerValues := buildStreamingHeaderValues(account, host)
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "*/*")
-		if ep.AmzTarget != "" {
-			req.Header.Set("X-Amz-Target", ep.AmzTarget)
+		if isTerminalKiroHTTPError(err) {
+			return err
 		}
-		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
-		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-		if err != nil {
-			lastErr = err
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-			continue
-		}
-
-		if resp.StatusCode == 429 {
-			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-				return lastErr
-			}
-			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
-			continue
-		}
-
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
-		return err
+		logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
 	}
 
 	if lastErr != nil {
@@ -404,124 +395,283 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	return fmt.Errorf("all endpoints failed")
 }
 
+// callKiroEndpointWithFirstTokenRetry 调用单个上游端点，并在首 token 超时时重新请求。
+func callKiroEndpointWithFirstTokenRetry(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, ep kiroEndpoint) error {
+	var lastErr error
+	for attempt := 1; attempt <= firstTokenMaxRetries; attempt++ {
+		err := callKiroEndpointOnce(account, payload, callback, ep)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errFirstTokenTimeout) {
+			return err
+		}
+		lastErr = err
+		logger.Warnf("[KiroAPI] Endpoint %s first token timeout attempt %d/%d", ep.Name, attempt, firstTokenMaxRetries)
+	}
+	return fmt.Errorf("%w on %s after %d attempts", errFirstTokenTimeout, ep.Name, firstTokenMaxRetries)
+}
+
+// callKiroEndpointOnce 发送一次 Kiro 请求并解析流式响应。
+func callKiroEndpointOnce(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, ep kiroEndpoint) error {
+	payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if len(reqBody) > maxPayloadBytes {
+		return newKiroPayloadTooLargeError(len(reqBody))
+	}
+
+	req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+
+	host := ""
+	if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
+		host = parsedURL.Host
+	}
+	headerValues := buildStreamingHeaderValues(account, host)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	if ep.AmzTarget != "" {
+		req.Header.Set("X-Amz-Target", ep.AmzTarget)
+	}
+	applyKiroBaseHeaders(req, account, headerValues)
+	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+	resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+		return fmt.Errorf("quota exhausted on %s", ep.Name)
+	}
+
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+	}
+
+	return parseEventStreamWithFirstTokenTimeout(resp.Body, callback, firstTokenTimeout)
+}
+
+// newKiroPayloadTooLargeError 生成明确的 payload 超限错误。
+func newKiroPayloadTooLargeError(size int) error {
+	return fmt.Errorf("%w: %d bytes exceeds limit %d bytes", errKiroPayloadTooLarge, size, maxPayloadBytes)
+}
+
+// isTerminalKiroHTTPError 判断是否为不应继续端点 fallback 的 HTTP 错误。
+func isTerminalKiroHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP 401") ||
+		strings.Contains(msg, "HTTP 402") ||
+		strings.Contains(msg, "HTTP 403")
+}
+
 // ==================== Event Stream Parsing ====================
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+	state := newKiroEventStreamState(callback)
+	for {
+		frame, done, truncated, err := readKiroEventFrame(body)
+		if err != nil {
+			return err
+		}
+		if truncated {
+			state.truncated = true
+			break
+		}
+		if done {
+			break
+		}
+		state.process(frame)
+	}
+	state.finish()
+	return nil
+}
+
+// parseEventStreamWithFirstTokenTimeout 解析流，并限制首个事件的等待时间。
+func parseEventStreamWithFirstTokenTimeout(body io.ReadCloser, callback *KiroStreamCallback, timeout time.Duration) error {
+	state := newKiroEventStreamState(callback)
+	frame, done, truncated, err := readFirstKiroEventFrame(body, timeout)
+	if err != nil {
+		return err
+	}
+	if truncated {
+		state.truncated = true
+		state.finish()
+		return nil
+	}
+	if done {
+		state.finish()
+		return nil
+	}
+	state.process(frame)
+
+	for {
+		frame, done, truncated, err := readKiroEventFrame(body)
+		if err != nil {
+			return err
+		}
+		if truncated {
+			state.truncated = true
+			break
+		}
+		if done {
+			break
+		}
+		state.process(frame)
+	}
+	state.finish()
+	return nil
+}
+
+// newKiroEventStreamState 创建 Kiro 事件流解析状态。
+func newKiroEventStreamState(callback *KiroStreamCallback) *kiroEventStreamState {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
+	return &kiroEventStreamState{callback: callback}
+}
 
-	// Read directly without bufio to avoid buffering latency in streaming responses.
-	var inputTokens, outputTokens int
-	var totalCredits float64
-	var currentToolUse *toolUseState
-	var lastAssistantContent string
-	var lastReasoningContent string
-	// truncated 标记流是否在消息中途被掐断（上游截断），用于通知上层改写 stop_reason。
-	var truncated bool
+// process 处理单个 Kiro 事件帧。
+func (s *kiroEventStreamState) process(frame kiroEventFrame) {
+	if len(frame.payloadBytes) == 0 {
+		return
+	}
+	var event map[string]interface{}
+	if err := json.Unmarshal(frame.payloadBytes, &event); err != nil {
+		return
+	}
 
-	for {
-		// Prelude: 12 bytes (total_len + headers_len + crc)
-		prelude := make([]byte, 12)
-		_, err := io.ReadFull(body, prelude)
-		if err == io.EOF {
-			break
-		}
-		if err == io.ErrUnexpectedEOF {
-			// 读到半个 prelude 就断流：上游中途截断，不当错误处理，
-			// 通知上层后正常结束，让 stop_reason 判定逻辑得以执行。
-			truncated = true
-			break
-		}
-		if err != nil {
-			return err
-		}
+	s.inputTokens, s.outputTokens = updateTokensFromEvent(event, s.inputTokens, s.outputTokens)
 
-		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
-		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
-
-		if totalLength < 16 {
-			continue
-		}
-
-		// Read the remaining message bytes.
-		remaining := totalLength - 12
-		msgBuf := make([]byte, remaining)
-		_, err = io.ReadFull(body, msgBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			// 消息体中途断流：上游截断，不当错误处理，正常结束。
-			truncated = true
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		if headersLength > len(msgBuf)-4 {
-			continue
-		}
-
-		eventType := extractEventType(msgBuf[0:headersLength])
-		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
-		if len(payloadBytes) == 0 {
-			continue
-		}
-
-		var event map[string]interface{}
-		if err := json.Unmarshal(payloadBytes, &event); err != nil {
-			continue
-		}
-
-		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
-
-		// Dispatch by event type.
-		switch eventType {
-		case "assistantResponseEvent":
-			if content, ok := event["content"].(string); ok && content != "" {
-				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, false)
-				}
+	switch frame.eventType {
+	case "assistantResponseEvent":
+		if content, ok := event["content"].(string); ok && content != "" {
+			normalized := normalizeChunk(content, &s.lastAssistantContent)
+			if normalized != "" && s.callback.OnText != nil {
+				s.callback.OnText(normalized, false)
 			}
-		case "reasoningContentEvent":
-			if text, ok := event["text"].(string); ok && text != "" {
-				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, true)
-				}
+		}
+	case "reasoningContentEvent":
+		if text, ok := event["text"].(string); ok && text != "" {
+			normalized := normalizeChunk(text, &s.lastReasoningContent)
+			if normalized != "" && s.callback.OnText != nil {
+				s.callback.OnText(normalized, true)
 			}
-		case "toolUseEvent":
-			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
-		case "meteringEvent":
-			if usage, ok := event["usage"].(float64); ok {
-				totalCredits += usage
-			}
-		case "contextUsageEvent":
-			if pct, ok := event["contextUsagePercentage"].(float64); ok {
-				if callback.OnContextUsage != nil {
-					callback.OnContextUsage(pct)
-				}
+		}
+	case "toolUseEvent":
+		s.currentToolUse = handleToolUseEvent(event, s.currentToolUse, s.callback)
+	case "meteringEvent":
+		if usage, ok := event["usage"].(float64); ok {
+			s.totalCredits += usage
+		}
+	case "contextUsageEvent":
+		if pct, ok := event["contextUsagePercentage"].(float64); ok {
+			if s.callback.OnContextUsage != nil {
+				s.callback.OnContextUsage(pct)
 			}
 		}
 	}
+}
 
-	if currentToolUse != nil {
-		finishToolUse(currentToolUse, callback)
+// finish 完成 Kiro 事件流解析并发出收尾回调。
+func (s *kiroEventStreamState) finish() {
+	if s.currentToolUse != nil {
+		finishToolUse(s.currentToolUse, s.callback)
+	}
+	if s.callback.OnCredits != nil && s.totalCredits > 0 {
+		s.callback.OnCredits(s.totalCredits)
+	}
+	if s.truncated && s.callback.OnTruncated != nil {
+		s.callback.OnTruncated()
+	}
+	if s.callback.OnComplete != nil {
+		s.callback.OnComplete(s.inputTokens, s.outputTokens)
+	}
+}
+
+// readFirstKiroEventFrame 在超时时间内读取第一个 Kiro 事件帧。
+func readFirstKiroEventFrame(body io.ReadCloser, timeout time.Duration) (kiroEventFrame, bool, bool, error) {
+	if timeout <= 0 {
+		return readKiroEventFrame(body)
+	}
+	ch := make(chan kiroEventFrameResult, 1)
+	go func() {
+		frame, done, truncated, err := readKiroEventFrame(body)
+		ch <- kiroEventFrameResult{frame: frame, done: done, truncated: truncated, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-ch:
+		return result.frame, result.done, result.truncated, result.err
+	case <-timer.C:
+		_ = body.Close()
+		return kiroEventFrame{}, false, false, errFirstTokenTimeout
+	}
+}
+
+// readKiroEventFrame 读取一个 AWS Event Stream 事件帧。
+func readKiroEventFrame(body io.Reader) (kiroEventFrame, bool, bool, error) {
+	prelude := make([]byte, 12)
+	_, err := io.ReadFull(body, prelude)
+	if err == io.EOF {
+		return kiroEventFrame{}, true, false, nil
+	}
+	if err == io.ErrUnexpectedEOF {
+		return kiroEventFrame{}, false, true, nil
+	}
+	if err != nil {
+		return kiroEventFrame{}, false, false, err
 	}
 
-	if callback.OnCredits != nil && totalCredits > 0 {
-		callback.OnCredits(totalCredits)
+	totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
+	headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
+	if totalLength < 16 {
+		return kiroEventFrame{}, false, false, nil
 	}
 
-	if truncated && callback.OnTruncated != nil {
-		callback.OnTruncated()
+	remaining := totalLength - 12
+	msgBuf := make([]byte, remaining)
+	_, err = io.ReadFull(body, msgBuf)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return kiroEventFrame{}, false, true, nil
+	}
+	if err != nil {
+		return kiroEventFrame{}, false, false, err
 	}
 
-	if callback.OnComplete != nil {
-		callback.OnComplete(inputTokens, outputTokens)
+	if headersLength > len(msgBuf)-4 {
+		return kiroEventFrame{}, false, false, nil
 	}
-	return nil
+
+	payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
+	if len(payloadBytes) == 0 {
+		return kiroEventFrame{}, false, false, nil
+	}
+
+	return kiroEventFrame{
+		eventType:    extractEventType(msgBuf[0:headersLength]),
+		payloadBytes: payloadBytes,
+	}, false, false, nil
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {

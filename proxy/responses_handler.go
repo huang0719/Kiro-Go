@@ -170,6 +170,9 @@ func (h *Handler) handleResponsesNonStream(
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			if isRequestScopedErrorMessage(err.Error()) {
+				break
+			}
 			continue
 		}
 
@@ -482,6 +485,9 @@ func (h *Handler) handleResponsesStream(
 				lastErr = err
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, err)
+				if isRequestScopedErrorMessage(err.Error()) {
+					break
+				}
 				continue
 			}
 			send("response.failed", map[string]interface{}{
@@ -496,6 +502,7 @@ func (h *Handler) handleResponsesStream(
 				},
 			})
 			h.recordFailure()
+			h.pool.Release(account.ID)
 			return
 		}
 

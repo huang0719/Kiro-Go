@@ -174,6 +174,10 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// AccountMaxConcurrent limits concurrent in-flight requests per account.
+	// Defaults to 3 while the pool still prefers idle accounts first.
+	AccountMaxConcurrent int `json:"accountMaxConcurrent,omitempty"`
+
 	// DetectTruncation enables mid-stream truncation detection. Kiro upstream emits
 	// a contextUsageEvent as a completion signal when a turn finishes normally. If a
 	// stream produces text but ends WITHOUT that signal and without any tool call, the
@@ -799,7 +803,7 @@ func GetPreferredEndpoint() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg.PreferredEndpoint == "" {
-		return "auto"
+		return "kiro"
 	}
 	return cfg.PreferredEndpoint
 }
@@ -879,6 +883,16 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
+}
+
+// GetAccountMaxConcurrent 返回单账号最大并发数，默认 3。
+func GetAccountMaxConcurrent() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AccountMaxConcurrent <= 0 {
+		return 3
+	}
+	return cfg.AccountMaxConcurrent
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

@@ -46,7 +46,7 @@ func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 	}
 }
 
-func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
+func TestBuildClaudeUsageMapUsesEstimatedInputTokens(t *testing.T) {
 	usage := promptCacheUsage{
 		CacheCreationInputTokens:   30,
 		CacheReadInputTokens:       20,
@@ -56,21 +56,17 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 
 	m := buildClaudeUsageMap(100, 50, usage, true)
 
-	if got := m["input_tokens"]; got != 50 {
-		t.Fatalf("expected billed input tokens 50, got %#v", got)
+	if got := m["input_tokens"]; got != 100 {
+		t.Fatalf("expected estimated input tokens 100, got %#v", got)
 	}
-	if got := m["cache_creation_input_tokens"]; got != 30 {
-		t.Fatalf("expected cache creation tokens 30, got %#v", got)
+	if got := m["output_tokens"]; got != 50 {
+		t.Fatalf("expected output tokens 50, got %#v", got)
 	}
-	if got := m["cache_read_input_tokens"]; got != 20 {
-		t.Fatalf("expected cache read tokens 20, got %#v", got)
+	if _, ok := m["cache_creation_input_tokens"]; ok {
+		t.Fatalf("did not expect simulated cache creation tokens: %#v", m)
 	}
-	creation, ok := m["cache_creation"].(map[string]int)
-	if !ok {
-		t.Fatalf("expected typed cache creation map, got %#v", m["cache_creation"])
-	}
-	if creation["ephemeral_5m_input_tokens"] != 10 || creation["ephemeral_1h_input_tokens"] != 20 {
-		t.Fatalf("unexpected ttl breakdown: %#v", creation)
+	if _, ok := m["cache_read_input_tokens"]; ok {
+		t.Fatalf("did not expect simulated cache read tokens: %#v", m)
 	}
 }
 

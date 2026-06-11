@@ -45,6 +45,14 @@ func isAuthErrorMessage(msg string) bool {
 		strings.Contains(msg, "refresh token expired")
 }
 
+// isRequestScopedErrorMessage 判断错误是否属于请求本身，不能惩罚或切换账号重试。
+func isRequestScopedErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "kiro payload too large") ||
+		strings.Contains(msg, "kiro first token timeout") ||
+		strings.Contains(msg, "content_length_exceeds_threshold")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
@@ -95,6 +103,8 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 	errMsg := err.Error()
 	switch {
+	case isRequestScopedErrorMessage(errMsg):
+		h.pool.Release(account.ID)
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
