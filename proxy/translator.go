@@ -1459,6 +1459,27 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 	return true
 }
 
+// historyToolResultsMatchPreviousAssistant 判断历史工具结果是否回答上一条 assistant tool_use。
+func historyToolResultsMatchPreviousAssistant(history []KiroHistoryMessage, idx int, toolResults []KiroToolResult) bool {
+	if idx <= 0 || len(toolResults) == 0 {
+		return false
+	}
+	prev := history[idx-1]
+	if prev.AssistantResponseMessage == nil || len(prev.AssistantResponseMessage.ToolUses) == 0 {
+		return false
+	}
+	resultIDs := collectToolResultIDs(toolResults)
+	if len(resultIDs) == 0 {
+		return false
+	}
+	for _, tu := range prev.AssistantResponseMessage.ToolUses {
+		if !resultIDs[tu.ToolUseID] {
+			return false
+		}
+	}
+	return true
+}
+
 // pollutedToolCallTextPattern matches the legacy "[Called tool X with input ...]"
 // / "[Called tool X]" narration that an earlier version of this proxy wrote into
 // assistant turns. Models trained on that in-context text began emitting it as
@@ -1593,6 +1614,19 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		return history
 	}
 
+	pairedAssistant := make(map[int]bool)
+	pairedUserResults := make(map[int]bool)
+	for i := 1; i < len(history); i++ {
+		msg := history[i]
+		if msg.UserInputMessage == nil || msg.UserInputMessage.UserInputMessageContext == nil {
+			continue
+		}
+		if historyToolResultsMatchPreviousAssistant(history, i, msg.UserInputMessage.UserInputMessageContext.ToolResults) {
+			pairedAssistant[i-1] = true
+			pairedUserResults[i] = true
+		}
+	}
+
 	// Determine whether the last history assistant turn is the "active" tool turn
 	// answered by the current message. If so, its structured toolUses stay.
 	activeIdx := -1
@@ -1625,8 +1659,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		}
 
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 {
-			if i == activeIdx {
-				continue // keep the active tool turn structured
+			if i == activeIdx || pairedAssistant[i] {
+				continue // keep paired tool turns structured
 			}
 			// Drop the structured tool calls WITHOUT writing any tool-invocation
 			// text into the assistant turn. Narrating the call here (e.g.
@@ -1640,10 +1674,12 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
 			if len(ctx.ToolResults) > 0 {
-				if strings.TrimSpace(msg.UserInputMessage.Content) == "" || msg.UserInputMessage.Content == minimalFallbackUserContent {
-					msg.UserInputMessage.Content = "Tool results provided."
+				if !pairedUserResults[i] {
+					if strings.TrimSpace(msg.UserInputMessage.Content) == "" || msg.UserInputMessage.Content == minimalFallbackUserContent {
+						msg.UserInputMessage.Content = "Tool results provided."
+					}
+					ctx.ToolResults = nil
 				}
-				ctx.ToolResults = nil
 			}
 			// History messages must not carry structured tool specs either.
 			ctx.Tools = nil
