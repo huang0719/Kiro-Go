@@ -1633,12 +1633,18 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			// "[Called tool X ...]") would give the model dozens of in-context
 			// examples of "invoke a tool by emitting this text", which it then
 			// imitates instead of issuing real structured tool calls. The tool's
-			// identity is preserved by keeping the result side structured.
+			// identity is intentionally not narrated into replayable text.
 			msg.AssistantResponseMessage.ToolUses = nil
 		}
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
+			if len(ctx.ToolResults) > 0 {
+				if strings.TrimSpace(msg.UserInputMessage.Content) == "" || msg.UserInputMessage.Content == minimalFallbackUserContent {
+					msg.UserInputMessage.Content = "Tool results provided."
+				}
+				ctx.ToolResults = nil
+			}
 			// History messages must not carry structured tool specs either.
 			ctx.Tools = nil
 			if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
