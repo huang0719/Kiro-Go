@@ -4,6 +4,8 @@ package pool
 
 import (
 	"kiro-go/config"
+	"kiro-go/logger"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,20 +145,39 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 // acquireAccount 按最少 in-flight 优先的顺序占用账号。
 func (p *AccountPool) acquireAccount(model string, excluded map[string]bool) *config.Account {
 	deadline := time.Now().Add(accountAcquireWait)
+	waiting := false
 	for {
 		p.mu.Lock()
 		p.ensureRuntimeLocked()
 		acc, blockedByBusy := p.selectAccountLocked(model, excluded)
 		if acc != nil {
-			p.inFlight[acc.ID]++
+			before := p.inFlight[acc.ID]
+			p.inFlight[acc.ID] = before + 1
+			maxConcurrent := config.GetAccountMaxConcurrent()
+			snapshot := p.loadSnapshotLocked(maxConcurrent)
 			p.mu.Unlock()
+			logger.Infof("[LoadBalance] acquired account=%s id=%s model=%s inFlight=%d/%d queued=%v load=[%s]",
+				accountLabel(acc), acc.ID, modelLabel(model), before+1, maxConcurrent, waiting, snapshot)
 			return acc
 		}
 		if !blockedByBusy || time.Now().After(deadline) {
+			snapshot := p.loadSnapshotLocked(config.GetAccountMaxConcurrent())
 			p.mu.Unlock()
+			if blockedByBusy {
+				logger.Warnf("[LoadBalance] queue timeout model=%s wait=%s load=[%s]", modelLabel(model), accountAcquireWait, snapshot)
+			} else {
+				logger.Warnf("[LoadBalance] no eligible account model=%s load=[%s]", modelLabel(model), snapshot)
+			}
 			return nil
 		}
+		if !waiting {
+			logger.Warnf("[LoadBalance] all eligible accounts busy, queueing model=%s wait<=%s load=[%s]",
+				modelLabel(model), time.Until(deadline).Round(time.Millisecond), p.loadSnapshotLocked(config.GetAccountMaxConcurrent()))
+			waiting = true
+		}
 		p.waitLocked(deadline)
+		logger.Infof("[LoadBalance] queue wake model=%s remaining=%s load=[%s]",
+			modelLabel(model), time.Until(deadline).Round(time.Millisecond), p.loadSnapshotLocked(config.GetAccountMaxConcurrent()))
 		p.mu.Unlock()
 	}
 }
@@ -319,11 +340,64 @@ func (p *AccountPool) releaseAccountLocked(id string) {
 	if id == "" {
 		return
 	}
+	before := p.inFlight[id]
+	if before <= 0 {
+		return
+	}
 	if p.inFlight[id] <= 1 {
 		delete(p.inFlight, id)
+		logger.Infof("[LoadBalance] released account id=%s inFlight=%d->0 load=[%s]",
+			id, before, p.loadSnapshotLocked(config.GetAccountMaxConcurrent()))
 		return
 	}
 	p.inFlight[id]--
+	logger.Infof("[LoadBalance] released account id=%s inFlight=%d->%d load=[%s]",
+		id, before, p.inFlight[id], p.loadSnapshotLocked(config.GetAccountMaxConcurrent()))
+}
+
+// loadSnapshotLocked 返回当前账号负载快照，调用方必须持有 p.mu。
+func (p *AccountPool) loadSnapshotLocked(maxConcurrent int) string {
+	seen := make(map[string]bool)
+	parts := make([]string, 0, len(p.accounts))
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if seen[acc.ID] {
+			continue
+		}
+		seen[acc.ID] = true
+		parts = append(parts, accountLabel(acc)+":"+intString(p.inFlight[acc.ID])+"/"+intString(maxConcurrent))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// accountLabel 返回日志使用的账号标识。
+func accountLabel(acc *config.Account) string {
+	if acc == nil {
+		return "unknown"
+	}
+	if strings.TrimSpace(acc.Email) != "" {
+		return acc.Email
+	}
+	if strings.TrimSpace(acc.Name) != "" {
+		return acc.Name
+	}
+	return acc.ID
+}
+
+// modelLabel 返回日志使用的模型标识。
+func modelLabel(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "any"
+	}
+	return model
+}
+
+// intString 将整数转换为日志字符串。
+func intString(v int) string {
+	return strconv.Itoa(v)
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
