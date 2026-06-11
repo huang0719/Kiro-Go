@@ -50,7 +50,8 @@ func isRequestScopedErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "kiro payload too large") ||
 		strings.Contains(msg, "kiro first token timeout") ||
-		strings.Contains(msg, "content_length_exceeds_threshold")
+		strings.Contains(msg, "content_length_exceeds_threshold") ||
+		(strings.Contains(msg, "http 400") && strings.Contains(msg, "improperly formed request"))
 }
 
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {

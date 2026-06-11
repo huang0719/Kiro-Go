@@ -475,6 +475,7 @@ func isTerminalKiroHTTPError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "HTTP 401") ||
+		(strings.Contains(msg, "HTTP 400") && strings.Contains(strings.ToLower(msg), "improperly formed request")) ||
 		strings.Contains(msg, "HTTP 402") ||
 		strings.Contains(msg, "HTTP 403")
 }
